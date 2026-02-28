@@ -2,9 +2,13 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
+require("dotenv").config();
 
-const db = require("./db");
+
+//const db = require("./db");
 // const { rand, nowIso, maybeEvent, severityFor } = require("./simulate");
+const pool = require("./db_pg");
+
 
 const app = express();
 app.use(cors());
@@ -16,35 +20,38 @@ const io = new Server(server, { cors: { origin: "*" } });
 // ---------- REST API ----------
 
 // Devices list
-app.get("/api/devices", (req, res) => {
-  const rows = db.prepare("SELECT id, name FROM devices").all();
+app.get("/api/devices", async (req, res) => {
+  const { rows } = await pool.query("SELECT id, name FROM devices ORDER BY id");
   res.json(rows);
 });
 
+
 // Latest metrics for one device
-app.get("/api/metrics/:deviceId", (req, res) => {
+app.get("/api/metrics/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
 
-  // master voltage + frequency
-  const master = db
-  .prepare("SELECT voltage_rms, frequency, updated_at FROM master_metrics WHERE id=1")
-  .get();
+  const masterQ = await pool.query(
+    "SELECT voltage_rms, frequency, updated_at FROM master_metrics WHERE id=1"
+  );
+  const plugQ = await pool.query(
+    "SELECT device_id, current_rms, active_power, power_factor, updated_at FROM latest_metrics WHERE device_id=$1",
+    [deviceId]
+  );
 
-  // plug current + power + pf
-  const plug = db.prepare(
-    "SELECT device_id, current_rms, active_power, power_factor, updated_at FROM latest_metrics WHERE device_id=?"
-  ).get(deviceId);
+  const master = masterQ.rows[0] || {};
+  const plug = plugQ.rows[0] || {};
 
   res.json({
     device_id: deviceId,
-    voltage_rms: master?.voltage_rms ?? null,
-    frequency: master?.frequency ?? null,
-    current_rms: plug?.current_rms ?? null,
-    active_power: plug?.active_power ?? null,
-    power_factor: plug?.power_factor ?? null,
-    updated_at: plug?.updated_at ?? master?.updated_at ?? null,
+    voltage_rms: master.voltage_rms ?? null,
+    frequency: master.frequency ?? null,
+    current_rms: plug.current_rms ?? null,
+    active_power: plug.active_power ?? null,
+    power_factor: plug.power_factor ?? null,
+    updated_at: plug.updated_at ?? master.updated_at ?? null,
   });
 });
+
 
 
 // PQ events for one device (latest 50)
@@ -87,83 +94,93 @@ app.get("/api/reports/:deviceId/:date/download", (req, res) => {
 // ---------- Device ON/OFF State ----------
 
 // Get current ON/OFF state of a device
-app.get("/api/state/:deviceId", (req, res) => {
+app.get("/api/state/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
 
-  const row = db
-    .prepare("SELECT device_id, is_on, updated_at FROM device_state WHERE device_id=?")
-    .get(deviceId);
+  const q = await pool.query(
+    "SELECT device_id, is_on, updated_at FROM device_state WHERE device_id=$1",
+    [deviceId]
+  );
 
-  res.json(row || { device_id: deviceId, is_on: 1 });
+  res.json(q.rows[0] || { device_id: deviceId, is_on: 1 });
 });
 
+
 // Update ON/OFF state of a device
-app.post("/api/state/:deviceId", (req, res) => {
+app.post("/api/state/:deviceId", async (req, res) => {
   const { deviceId } = req.params;
-  const { is_on } = req.body; // must be 0 or 1
+  const { is_on } = req.body;
 
   if (is_on !== 0 && is_on !== 1) {
     return res.status(400).json({ error: "is_on must be 0 or 1" });
   }
 
-  db.prepare(`
+  await pool.query(
+    `
     INSERT INTO device_state(device_id, is_on, updated_at)
-    VALUES (?, ?, ?)
+    VALUES ($1, $2, now())
     ON CONFLICT(device_id) DO UPDATE SET
       is_on=excluded.is_on,
       updated_at=excluded.updated_at
-  `).run(deviceId, is_on, new Date().toISOString());
+    `,
+    [deviceId, is_on]
+  );
 
-  // Send live update to dashboard users who subscribed to this device
   io.to(deviceId).emit("state", { device_id: deviceId, is_on });
 
   res.json({ device_id: deviceId, is_on });
 });
 
+
 // Master ESP32 sends Voltage RMS + Frequency
-app.post("/api/ingest/master", (req, res) => {
+app.post("/api/ingest/master", async (req, res) => {
   const { voltage_rms, frequency } = req.body;
 
   if (typeof voltage_rms !== "number" || typeof frequency !== "number") {
     return res.status(400).json({ error: "voltage_rms and frequency must be numbers" });
   }
 
-  db.prepare(`
+  await pool.query(
+    `
     INSERT INTO master_metrics (id, voltage_rms, frequency, updated_at)
-    VALUES (1, ?, ?, ?)
+    VALUES (1, $1, $2, now())
     ON CONFLICT(id) DO UPDATE SET
       voltage_rms=excluded.voltage_rms,
       frequency=excluded.frequency,
       updated_at=excluded.updated_at
-  `).run(voltage_rms, frequency, new Date().toISOString());
+    `,
+    [voltage_rms, frequency]
+  );
 
   io.emit("master_metrics", { voltage_rms, frequency });
-
   res.json({ ok: true });
 });
 
-app.post("/api/ingest/plug", (req, res) => {
+
+app.post("/api/ingest/plug", async (req, res) => {
   const { device_id, current_rms, active_power, power_factor } = req.body;
 
   if (!device_id) return res.status(400).json({ error: "device_id is required" });
 
-  db.prepare(`
+  await pool.query(
+    `
     INSERT INTO latest_metrics(device_id, current_rms, active_power, power_factor, updated_at)
-    VALUES (?, ?, ?, ?, ?)
+    VALUES ($1, $2, $3, $4, now())
     ON CONFLICT(device_id) DO UPDATE SET
       current_rms=excluded.current_rms,
       active_power=excluded.active_power,
       power_factor=excluded.power_factor,
       updated_at=excluded.updated_at
-  `).run(device_id, current_rms, active_power, power_factor, new Date().toISOString());
+    `,
+    [device_id, current_rms, active_power, power_factor]
+  );
 
-  // ✅ Emit using the same event frontend listens to
-  io.to(device_id).emit("metrics", {
-    device_id,
-    current_rms,
-    active_power,
-    power_factor
-  });
+  // emit "metrics" (so your UI updates live)
+  io.to(device_id).emit("metrics", { device_id, current_rms, active_power, power_factor });
+
+  res.json({ ok: true });
+});
+
 
   res.json({ ok: true });
 });
